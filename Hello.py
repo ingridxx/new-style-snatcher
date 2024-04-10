@@ -1,51 +1,102 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import streamlit as st
-from streamlit.logger import get_logger
+import pandas as pd
+from io import StringIO
+import pymysql
+from PIL import Image
+import tempfile
+from fashion_clip.fashion_clip import FashionCLIP
+import json
+import os
 
-LOGGER = get_logger(__name__)
+st.write("# Style Snatcher")
 
+max_price = st.slider("Set maximum price ($)", min_value=500, max_value=5000, value=2500, step=100)
+keyword = st.text_input("Enter keywords (optional):")
+uploaded_file = st.file_uploader("Choose an image!", type=['jpg', 'png', 'jpeg', 'webp'])
+if uploaded_file is not None:
+    image = Image.open(uploaded_file)
+    st.image(image, caption='I want to snatch this style ☝️', use_column_width=False, width=250)
+num_results = st.selectbox("Number of results:", options=[3, 6], index=0)  # Default to 3
 
-def run():
-    st.set_page_config(
-        page_title="Hello",
-        page_icon="👋",
-    )
+submit_button = st.button('Find Matches')
 
-    st.write("# Welcome to Streamlit! 👋")
+def generate_embedding(image_path):
+    fclip = FashionCLIP('fashion-clip')
+    embeddings = fclip.encode_images([image_path], batch_size=1)
+    embedding = embeddings[0]
+    embedding_list = embedding.tolist() if hasattr(embedding, 'tolist') else embedding
+    return embedding_list
 
-    st.sidebar.success("Select a demo above.")
+# Function to find top matches
+def find_top_matches(connection, embedding, embedding_type, max_price, keyword=None, num_results=3):
+    query_embedding_str = ','.join([str(num) for num in embedding])
 
-    st.markdown(
+    # Prepare the SQL command to set the vector query
+    set_vector_query = f"SET @query_vec = '[{query_embedding_str}]' :> VECTOR(512);"
+
+    cursor = connection.cursor()
+
+    cursor.execute(set_vector_query)
+
+    if keyword:
+        query = f"""
+        SELECT brand_name, image_cutout_url, short_description, price, DOT_PRODUCT({embedding_type}_embedding, %s) AS similarity_score
+        FROM farfetch_listings
+        WHERE price <= %s AND MATCH(short_description) AGAINST(%s)
+        ORDER BY similarity_score DESC
+        LIMIT {num_results};
         """
-        Streamlit is an open-source app framework built specifically for
-        Machine Learning and Data Science projects.
-        **👈 Select a demo from the sidebar** to see some examples
-        of what Streamlit can do!
-        ### Want to learn more?
-        - Check out [streamlit.io](https://streamlit.io)
-        - Jump into our [documentation](https://docs.streamlit.io)
-        - Ask a question in our [community
-          forums](https://discuss.streamlit.io)
-        ### See more complex demos
-        - Use a neural net to [analyze the Udacity Self-driving Car Image
-          Dataset](https://github.com/streamlit/demo-self-driving)
-        - Explore a [New York City rideshare dataset](https://github.com/streamlit/demo-uber-nyc-pickups)
-    """
-    )
+        cursor.execute(query, (json.dumps(embedding), max_price, keyword))
+    else:
+        query = f"""
+        SELECT brand_name, image_cutout_url, short_description, price, DOT_PRODUCT({embedding_type}_embedding, %s) AS similarity_score
+        FROM farfetch_listings
+        WHERE price <= %s
+        ORDER BY similarity_score DESC
+        LIMIT {num_results};
+        """
+        cursor.execute(query, (json.dumps(embedding), max_price))
+    results = cursor.fetchall()
+    return results
 
+# Initialize connection
+def init_connection():
+    return pymysql.connect(**st.secrets["singlestore"])
 
-if __name__ == "__main__":
-    run()
+# Main logic
+if submit_button and uploaded_file is not None:
+    with st.spinner('Finding similar items...'):
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmpfile:
+            fp = tmpfile.name
+            tmpfile.write(uploaded_file.getvalue())
+    
+        # Pass the temporary file path to the embedding function
+        embedding = generate_embedding(fp)
+        # Clean up the temporary file
+        os.remove(fp)
+
+        # Establish connection
+        conn = init_connection()
+        
+        # Find top matches
+        matches = find_top_matches(conn, embedding, 'model', max_price, keyword, num_results=num_results)
+        
+        # Display results
+        # Calculate the number of rows needed
+        cols_per_row = 3
+        num_rows = (len(matches) + cols_per_row - 1) // cols_per_row  # Round up division
+        
+        # Create rows and columns dynamically
+        for row in range(num_rows):
+            cols = st.columns(cols_per_row)  # Create a new row of columns
+            for i in range(cols_per_row):
+                idx = row * cols_per_row + i  # Calculate overall index in matches
+                if idx < len(matches):  # Check if the index is within the range of matches
+                    match = matches[idx]
+                    with cols[i]:
+                        st.image(match[1], use_column_width=True)
+                        st.markdown(f"{match[2]} By **{match[0]}**")
+                        st.markdown(f"${match[3]}")
+                        st.markdown(f"*Similarity score: {round(match[4],2)}*")
+                        
